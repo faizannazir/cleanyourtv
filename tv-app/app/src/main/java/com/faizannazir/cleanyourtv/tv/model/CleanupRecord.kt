@@ -28,6 +28,7 @@ data class CleanupRecord(
 ) : Serializable
 
 data class CleanupBaseline(
+    val schemaVersion: Int = 1,
     val timestamp: Long,
     val deviceModel: String,
     val androidVersion: String,

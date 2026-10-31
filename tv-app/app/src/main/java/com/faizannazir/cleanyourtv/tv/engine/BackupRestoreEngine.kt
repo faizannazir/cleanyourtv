@@ -5,6 +5,7 @@ import com.faizannazir.cleanyourtv.tv.model.ActionType
 import com.faizannazir.cleanyourtv.tv.model.CleanupBaseline
 import com.faizannazir.cleanyourtv.tv.model.CleanupRecord
 import java.io.File
+import java.io.FileOutputStream
 import java.io.ObjectInputStream
 import java.io.ObjectOutputStream
 import java.nio.file.Files
@@ -20,14 +21,16 @@ class BackupRestoreEngine(private val context: Context) {
 
     @Synchronized
     fun saveBaseline(baseline: CleanupBaseline): Boolean {
+        val tempFile = File(backupDir, "latest_baseline.tmp")
         return try {
-            // Write to temp file first
-            val tempFile = File(backupDir, "latest_baseline.tmp")
-            ObjectOutputStream(tempFile.outputStream()).use { out ->
-                out.writeObject(baseline)
+            FileOutputStream(tempFile).use { fos ->
+                ObjectOutputStream(fos).use { oos ->
+                    oos.writeObject(baseline)
+                    oos.flush()
+                }
+                fos.fd.sync()
             }
 
-            // Atomic rename to avoid truncating latest_baseline.dat
             Files.move(
                 tempFile.toPath(),
                 latestBackupFile.toPath(),
@@ -35,23 +38,31 @@ class BackupRestoreEngine(private val context: Context) {
                 StandardCopyOption.ATOMIC_MOVE
             )
 
-            // Also keep timestamped backup
+            // Save timestamped copy
             val timestampFile = File(backupDir, "baseline_${baseline.timestamp}.dat")
-            ObjectOutputStream(timestampFile.outputStream()).use { out ->
-                out.writeObject(baseline)
+            FileOutputStream(timestampFile).use { fos ->
+                ObjectOutputStream(fos).use { oos ->
+                    oos.writeObject(baseline)
+                    oos.flush()
+                }
+                fos.fd.sync()
             }
             true
         } catch (_: Exception) {
+            if (tempFile.exists()) {
+                tempFile.delete()
+            }
             false
         }
     }
 
     @Synchronized
     fun loadLatestBaseline(): CleanupBaseline? {
-        if (!latestBackupFile.exists()) return null
+        if (!latestBackupFile.exists() || latestBackupFile.length() == 0L) return null
         return try {
             ObjectInputStream(latestBackupFile.inputStream()).use { input ->
-                input.readObject() as? CleanupBaseline
+                val obj = input.readObject() as? CleanupBaseline
+                if (obj != null && obj.schemaVersion >= 1) obj else null
             }
         } catch (_: Exception) {
             null
@@ -70,6 +81,7 @@ class BackupRestoreEngine(private val context: Context) {
         sb.append("  \"appName\": \"CleanYourTV\",\n")
         sb.append("  \"exportTimestamp\": ${System.currentTimeMillis()},\n")
         if (baseline != null) {
+            sb.append("  \"schemaVersion\": ${baseline.schemaVersion},\n")
             sb.append("  \"baselineTimestamp\": ${baseline.timestamp},\n")
             sb.append("  \"deviceModel\": \"${escapeJson(baseline.deviceModel)}\",\n")
             sb.append("  \"androidVersion\": \"${escapeJson(baseline.androidVersion)}\",\n")

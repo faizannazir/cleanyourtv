@@ -205,7 +205,6 @@ class SafetyRulesEngine {
         }
         return actionCommand.startsWith("pm disable-user") ||
                 actionCommand.startsWith("pm enable") ||
-                actionCommand.startsWith("pm clear") ||
                 actionCommand.startsWith("pm trim-caches") ||
                 actionCommand.startsWith("pm list packages") ||
                 actionCommand.startsWith("cmd appops") ||
