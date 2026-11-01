@@ -71,4 +71,11 @@ class SafetyRulesEngineTest {
         assertTrue(engine.validateCommand("com.tcl.partnercustomizer", "pm disable-user --user 0 com.tcl.partnercustomizer"))
         assertTrue(engine.validateCommand("com.tcl.partnercustomizer", "pm enable com.tcl.partnercustomizer"))
     }
+
+    @Test
+    fun testDataDeletingAndCacheDeletingCommandsAreRejected() {
+        assertFalse(engine.validateCommand("com.tcl.partnercustomizer", "pm clear com.tcl.partnercustomizer"))
+        assertFalse(engine.validateCommand("com.tcl.partnercustomizer", "pm trim-caches 999999 com.tcl.partnercustomizer"))
+        assertFalse(engine.validateCommand("com.tcl.partnercustomizer", "pm uninstall --user 0 com.tcl.partnercustomizer"))
+    }
 }

@@ -11,12 +11,14 @@ import android.widget.TextView
 import com.faizannazir.cleanyourtv.tv.adb.AdbConnection
 import com.faizannazir.cleanyourtv.tv.adb.AdbDeviceScanner
 import com.faizannazir.cleanyourtv.tv.engine.BackupRestoreEngine
+import com.faizannazir.cleanyourtv.tv.engine.CleanupContext
+import com.faizannazir.cleanyourtv.tv.engine.CleanupEngine
+import com.faizannazir.cleanyourtv.tv.engine.CommandRunner
+import com.faizannazir.cleanyourtv.tv.engine.RestoreEngine
 import com.faizannazir.cleanyourtv.tv.engine.SafetyRulesEngine
-import com.faizannazir.cleanyourtv.tv.model.ActionType
+import com.faizannazir.cleanyourtv.tv.engine.ShellOutput
 import com.faizannazir.cleanyourtv.tv.model.AppCategory
 import com.faizannazir.cleanyourtv.tv.model.AppInfo
-import com.faizannazir.cleanyourtv.tv.model.CleanupBaseline
-import com.faizannazir.cleanyourtv.tv.model.CleanupRecord
 import com.faizannazir.cleanyourtv.tv.model.DeviceInfo
 import java.io.File
 import java.io.FileInputStream
@@ -151,18 +153,11 @@ class MainActivity : Activity() {
             val disabledPkgs = mutableSetOf<String>()
 
             if (isAdbAvailable) {
-                val enabledOutput = adbConn.executeShellCommand("pm list packages -e").replace("Success:", "").replace("\r", "")
-                val disabledOutput = adbConn.executeShellCommand("pm list packages -d").replace("Success:", "").replace("\r", "")
+                val enabledOutput = adbConn.executeShellCommand("pm list packages -e")
+                val disabledOutput = adbConn.executeShellCommand("pm list packages -d")
 
-                enabledOutput.lines().forEach { line ->
-                    val pkg = line.replace("package:", "").trim()
-                    if (pkg.isNotBlank()) enabledPkgs.add(pkg)
-                }
-
-                disabledOutput.lines().forEach { line ->
-                    val pkg = line.replace("package:", "").trim()
-                    if (pkg.isNotBlank()) disabledPkgs.add(pkg)
-                }
+                enabledPkgs.addAll(ShellOutput.parsePackageList(enabledOutput))
+                disabledPkgs.addAll(ShellOutput.parsePackageList(disabledOutput))
 
                 adbConn.disconnect()
             } else {
@@ -217,124 +212,80 @@ class MainActivity : Activity() {
         }
 
         val appNames = candidates.map { it.packageName }.toTypedArray()
-        val checkedItems = BooleanArray(candidates.size) { true }
+        // Nothing is selected by default: cleanup only disables packages the person explicitly ticks.
+        val checkedItems = BooleanArray(candidates.size) { false }
 
-        AlertDialog.Builder(this)
+        var actionDialog: AlertDialog? = null
+        val dialog = AlertDialog.Builder(this)
             .setTitle("Confirm Debloat Candidates")
+            .setMessage(
+                "Only the packages you check are disabled. Protected packages are never eligible.\n\n" +
+                        "App data, cache, preferences and databases are never deleted. " +
+                        "Restore App States only restores the original enabled/disabled and AppOps state."
+            )
             .setMultiChoiceItems(appNames, checkedItems) { _, which, isChecked ->
                 checkedItems[which] = isChecked
+                actionDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled =
+                    checkedItems.any { it }
             }
             .setPositiveButton("Execute Debloat") { _, _ ->
                 val selectedToDisable = candidates.filterIndexed { index, _ -> checkedItems[index] }
                 executeDisableOperations(selectedToDisable)
             }
             .setNegativeButton("Cancel", null)
-            .show()
+            .create()
+        actionDialog = dialog
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = false
+        }
+        dialog.show()
     }
 
     private fun executeDisableOperations(targets: List<AppInfo>) {
         if (targets.isEmpty()) {
-            tvStatus.text = "Console Log:\nNo packages selected for disabling."
+            tvStatus.text = "Console Log:\nNo packages selected for disabling. No changes made."
             return
         }
 
         val host = getTargetHost()
         val port = getTargetPort()
-        tvStatus.text = "Console Log:\nCapturing pre-mutation baseline for $host:$port..."
+        tvStatus.text = "Console Log:\nCapturing original package and AppOps state for $host:$port..."
 
         executor.execute {
             val adbConn = AdbConnection(this, host, port)
-            val isAdbAvailable = adbConn.connect()
-
-            val records = mutableListOf<CleanupRecord>()
-
-            for (app in targets) {
-                val pkgName = app.packageName.replace("\r", "").trim()
-                if (safetyRulesEngine.isProtected(pkgName)) continue
-
-                val origAppOps = if (isAdbAvailable) {
-                    val res = adbConn.executeShellCommand("cmd appops get $pkgName RUN_IN_BACKGROUND").replace("\r", "").trim()
-                    if (res.contains("allow")) "allow" else "deny"
-                } else "allow"
-
-                records.add(
-                    CleanupRecord(
-                        id = "${System.currentTimeMillis()}_$pkgName",
-                        timestamp = System.currentTimeMillis(),
-                        packageName = pkgName,
-                        appLabel = app.label,
-                        previousState = app.isEnabled,
-                        previousAppOpsState = origAppOps,
-                        isDataCleared = false,
-                        requestedAction = ActionType.DISABLE_USER,
-                        operationResult = "Pending execution",
-                        isRestorable = true
-                    )
-                )
-            }
-
-            val existingBaseline = backupRestoreEngine.loadLatestBaseline()
-            val mergedRecords = if (existingBaseline != null) {
-                val existingMap = existingBaseline.records.associateBy { it.packageName }.toMutableMap()
-                records.forEach { newRec ->
-                    if (!existingMap.containsKey(newRec.packageName)) {
-                        existingMap[newRec.packageName] = newRec
-                    }
-                }
-                existingMap.values.toList()
-            } else records
-
-            val baseline = CleanupBaseline(
-                timestamp = System.currentTimeMillis(),
-                deviceModel = currentDeviceInfo?.model ?: "Android TV",
-                androidVersion = currentDeviceInfo?.androidVersion ?: "Unknown",
-                totalAppsScanned = scannedApps.size,
-                records = mergedRecords
-            )
-
-            val saved = backupRestoreEngine.saveBaseline(baseline)
-            if (!saved) {
-                if (isAdbAvailable) adbConn.disconnect()
+            if (!adbConn.connect()) {
+                adbConn.disconnect()
                 runOnUiThread {
-                    tvStatus.text = "ERROR: Failed to save baseline backup to disk.\nRefusing to touch TV or execute operations."
+                    tvStatus.text = "Console Log:\nADB unavailable at $host:$port.\nNo changes made to the TV."
                 }
                 return@execute
             }
 
-            val resultLog = StringBuilder()
-            resultLog.append("Debloat Execution Log ($host:$port):\n")
-            resultLog.append("------------------------------------\n")
-
-            for (app in targets) {
-                val pkgName = app.packageName.replace("\r", "").trim()
-                if (safetyRulesEngine.isProtected(pkgName)) {
-                    resultLog.append(" • SKIPPED (Protected): $pkgName\n")
-                    continue
+            try {
+                val cleanupEngine = CleanupEngine(
+                    safetyRulesEngine,
+                    backupRestoreEngine,
+                    CommandRunner { command -> adbConn.executeShellCommand(command) }
+                )
+                val outcome = cleanupEngine.executeCleanup(
+                    targets,
+                    CleanupContext(
+                        deviceModel = currentDeviceInfo?.model ?: "Android TV",
+                        androidVersion = currentDeviceInfo?.androidVersion ?: "Unknown",
+                        totalAppsScanned = scannedApps.size,
+                        targetLabel = "$host:$port"
+                    )
+                )
+                runOnUiThread {
+                    tvStatus.text = outcome.log
                 }
-
-                if (isAdbAvailable) {
-                    val denyBg = adbConn.executeShellCommand("cmd appops set $pkgName RUN_IN_BACKGROUND deny").replace("\r", "").trim()
-                    val cmd = "pm disable-user --user 0 $pkgName"
-                    val disableRes = adbConn.executeShellCommand(cmd).replace("\r", "").trim()
-
-                    resultLog.append(" • $pkgName\n")
-                    resultLog.append("   AppOps Background: $denyBg\n")
-                    resultLog.append("   Package Disable: $disableRes\n\n")
-                } else {
-                    resultLog.append(" • $pkgName: Recorded in baseline ($host:$port ADB port unavailable)\n\n")
+            } catch (e: Exception) {
+                runOnUiThread {
+                    tvStatus.text = "Console Log:\nERROR: Cleanup aborted: " +
+                            "${e.localizedMessage ?: e.toString()}\nThe saved baseline is unchanged."
                 }
-            }
-
-            if (isAdbAvailable) {
-                val verifyDisabled = adbConn.executeShellCommand("pm list packages -d").replace("Success:", "").replace("\r", "")
-                resultLog.append("Verification: TV Disabled Package List Updated (${verifyDisabled.lines().count { it.contains("package:") }} packages disabled).\n")
+            } finally {
                 adbConn.disconnect()
-            }
-
-            resultLog.append("\n✓ Pre-debloat baseline saved atomically to storage before mutations.\n")
-
-            runOnUiThread {
-                tvStatus.text = resultLog.toString()
             }
         }
     }
@@ -497,50 +448,46 @@ class MainActivity : Activity() {
     private fun runRestore() {
         val baseline = backupRestoreEngine.loadLatestBaseline()
         if (baseline == null) {
-            tvStatus.text = "Console Log:\nNo saved cleanup baseline found to restore."
+            tvStatus.text = "Console Log:\nNo valid package-state baseline found to restore.\nNothing on the TV was changed."
             return
         }
         val plan = backupRestoreEngine.generateRestorePlan(baseline)
         if (plan.isEmpty()) {
-            tvStatus.text = "Console Log:\nAll packages in baseline are already enabled or restored."
+            tvStatus.text = "Console Log:\nNo restorable package-state records were found. Nothing was changed."
             return
         }
 
         val host = getTargetHost()
         val port = getTargetPort()
-        tvStatus.text = "Console Log:\nExecuting Restoration Plan (${plan.size} packages) on $host:$port..."
+        tvStatus.text = "Console Log:\nRestoring original package and AppOps states for ${plan.size} packages on $host:$port..."
 
         executor.execute {
             val adbConn = AdbConnection(this, host, port)
-            val isAdbAvailable = adbConn.connect()
-
-            val resultLog = StringBuilder()
-            resultLog.append("Restoration Execution Log ($host:$port):\n")
-            resultLog.append("------------------------------------\n")
-
-            for (record in plan) {
-                val enableCmd = "pm enable ${record.packageName}"
-                val appOpsCmd = "cmd appops set ${record.packageName} RUN_IN_BACKGROUND ${record.previousAppOpsState}"
-
-                val opResult1 = if (isAdbAvailable) {
-                    adbConn.executeShellCommand(enableCmd).replace("\r", "").trim()
-                } else "Recorded ($host:$port ADB unavailable)"
-
-                val opResult2 = if (isAdbAvailable) {
-                    adbConn.executeShellCommand(appOpsCmd).replace("\r", "").trim()
-                } else "Recorded ($host:$port ADB unavailable)"
-
-                resultLog.append(" • Restored [${record.appLabel}] (${record.packageName})\n")
-                resultLog.append("   Package Enable: $opResult1\n")
-                resultLog.append("   AppOps State Restored (${record.previousAppOpsState}): $opResult2\n\n")
-            }
-
-            if (isAdbAvailable) {
+            if (!adbConn.connect()) {
                 adbConn.disconnect()
+                runOnUiThread {
+                    tvStatus.text = "Console Log:\nADB unavailable at $host:$port.\nNo changes made to the TV."
+                }
+                return@execute
             }
 
-            runOnUiThread {
-                tvStatus.text = resultLog.toString()
+            try {
+                val restoreEngine = RestoreEngine(
+                    safetyRulesEngine,
+                    backupRestoreEngine,
+                    CommandRunner { command -> adbConn.executeShellCommand(command) }
+                )
+                val outcome = restoreEngine.restore(baseline, "$host:$port")
+                runOnUiThread {
+                    tvStatus.text = outcome.log
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    tvStatus.text = "Console Log:\nERROR: Restoration aborted: " +
+                            "${e.localizedMessage ?: e.toString()}\nThe baseline is unchanged; run Restore App States again."
+                }
+            } finally {
+                adbConn.disconnect()
             }
         }
     }

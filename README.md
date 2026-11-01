@@ -878,4 +878,4 @@ MIT, see [`LICENSE`](LICENSE). The Outfit typeface is under the SIL Open Font Li
 
 ## CleanYourTV TV Edition (`tv-app`)
 
-CleanYourTV now includes a native, standalone Android TV application in `tv-app/`. It can be built and installed directly on TV devices for local package scanning, debloating review, baseline backup, and restoration.
+CleanYourTV now includes a native, standalone Android TV application in `tv-app/`. It can be built and installed directly on TV devices for local package scanning, debloating review, and restoring the original enabled/disabled and AppOps state after cleanup. It only disables explicitly selected, unprotected packages and never deletes app data, cache, preferences or databases.
