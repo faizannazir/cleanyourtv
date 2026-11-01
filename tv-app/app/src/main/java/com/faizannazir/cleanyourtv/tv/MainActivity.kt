@@ -17,13 +17,12 @@ import com.faizannazir.cleanyourtv.tv.engine.CommandRunner
 import com.faizannazir.cleanyourtv.tv.engine.RestoreEngine
 import com.faizannazir.cleanyourtv.tv.engine.SafetyRulesEngine
 import com.faizannazir.cleanyourtv.tv.engine.ShellOutput
+import com.faizannazir.cleanyourtv.tv.launcher.AdbLauncherTransport
+import com.faizannazir.cleanyourtv.tv.launcher.LauncherDeploymentWorkflow
+import com.faizannazir.cleanyourtv.tv.launcher.PackagedLauncherApkProvider
 import com.faizannazir.cleanyourtv.tv.model.AppCategory
 import com.faizannazir.cleanyourtv.tv.model.AppInfo
 import com.faizannazir.cleanyourtv.tv.model.DeviceInfo
-import java.io.File
-import java.io.FileInputStream
-import java.io.FileOutputStream
-import java.io.InputStream
 import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
@@ -293,92 +292,17 @@ class MainActivity : Activity() {
     private fun runInstallCleanLauncher() {
         val host = getTargetHost()
         val port = getTargetPort()
-        tvStatus.text = "Console Log:\nExtracting Clean Launcher APK & deploying to $host:$port..."
+        tvStatus.text = "Console Log:\nChecking the packaged Clean Launcher and deploying it to $host:$port..."
 
         executor.execute {
-            val log = StringBuilder()
-            log.append("Clean Launcher Deployment Log ($host:$port):\n")
-            log.append("-------------------------------------------\n")
-
-            try {
-                val apkFile = File(cacheDir, "clean_launcher.apk")
-                if (apkFile.exists()) {
-                    apkFile.delete()
-                }
-
-                var assetStream: InputStream? = null
-                try {
-                    val rawId = resources.getIdentifier("clean_launcher", "raw", packageName)
-                    if (rawId != 0) {
-                        assetStream = resources.openRawResource(rawId)
-                    }
-                } catch (_: Exception) {}
-
-                if (assetStream == null) {
-                    try {
-                        assetStream = assets.open("clean_launcher.apk")
-                    } catch (_: Exception) {
-                        try {
-                            assetStream = assets.openFd("clean_launcher.apk").createInputStream()
-                        } catch (_: Exception) {
-                            try {
-                                assetStream = javaClass.classLoader?.getResourceAsStream("assets/clean_launcher.apk")
-                            } catch (_: Exception) {}
-                        }
-                    }
-                }
-
-                var extracted = false
-                if (assetStream != null) {
-                    assetStream.use { input ->
-                        FileOutputStream(apkFile).use { output ->
-                            input.copyTo(output)
-                        }
-                    }
-                    extracted = apkFile.exists() && apkFile.length() > 0
-                }
-
-                if (extracted && apkFile.exists()) {
-                    log.append("✓ Clean Launcher APK extracted (${apkFile.length()} bytes).\n")
-
-                    val adbConn = AdbConnection(this, host, port)
-                    val isAdbAvailable = adbConn.connect()
-
-                    if (isAdbAvailable) {
-                        val streamRes = FileInputStream(apkFile).use { apkInput ->
-                            adbConn.installApkStream(apkInput, apkFile.length())
-                        }
-                        log.append(" • Streaming APK Install: $streamRes\n")
-
-                        adbConn.executeShellCommand("pm grant com.gathin.tvhome android.permission.WRITE_SECURE_SETTINGS")
-                        adbConn.executeShellCommand("pm grant com.gathin.tvhome android.permission.ACCESS_FINE_LOCATION")
-                        adbConn.executeShellCommand("pm grant com.gathin.tvhome android.permission.ACCESS_COARSE_LOCATION")
-
-                        val setDefaultRes = adbConn.executeShellCommand("cmd package set-home-activity com.gathin.tvhome/.MainActivity")
-                        log.append(" • Set Default Home Activity: $setDefaultRes\n")
-
-                        val disable1 = adbConn.executeShellCommand("pm disable-user --user 0 com.google.android.apps.tv.launcherx")
-                        val disable2 = adbConn.executeShellCommand("pm disable-user --user 0 com.google.android.tvlauncher")
-                        val disable3 = adbConn.executeShellCommand("pm disable-user --user 0 com.tcl.tvhome")
-
-                        log.append(" • Stock Launcher Disabling Results:\n")
-                        log.append("   - LauncherX: $disable1\n")
-                        log.append("   - Android TV Launcher: $disable2\n")
-                        log.append("   - TCL Home: $disable3\n")
-
-                        adbConn.disconnect()
-                    } else {
-                        log.append(" • Target ADB service at $host:$port unavailable.\n  Turn Wireless Debugging ON in TV Developer Options.\n")
-                    }
-                } else {
-                    log.append("Error: Clean Launcher APK resource stream could not be opened.\n")
-                }
-            } catch (e: Exception) {
-                log.append("Error during launcher deployment: ${e.localizedMessage ?: e.toString()}\n")
-            }
+            val workflow = LauncherDeploymentWorkflow(
+                apkProvider = PackagedLauncherApkProvider(this, cacheDir),
+                transportFactory = { AdbLauncherTransport(this, host, port) }
+            )
+            val outcome = workflow.deploy()
 
             runOnUiThread {
-                tvStatus.text = log.toString()
+                tvStatus.text = outcome.asConsoleText()
             }
         }
     }

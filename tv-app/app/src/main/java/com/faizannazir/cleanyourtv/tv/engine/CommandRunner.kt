@@ -15,7 +15,21 @@ object ShellOutput {
      * produced no output with this sentence. It is a transport status, not shell output, so it is
      * treated as an empty result instead of data.
      */
-    const val EMPTY_OUTPUT_NOTICE = "Command transmitted to TV ADB daemon."
+    const val EMPTY_OUTPUT_NOTICE = com.faizannazir.cleanyourtv.tv.adb.AdbConnection.EMPTY_OUTPUT_NOTICE
+
+    /**
+     * A response that ended before the remote ADB `CLSE`. The command may or may not have run, so it
+     * is always treated as a failure and is never retried automatically.
+     */
+    const val UNCERTAIN_MARKER = com.faizannazir.cleanyourtv.tv.adb.AdbConnection.UNCERTAIN_MARKER
+
+    fun isUncertain(raw: String): Boolean = raw.contains(UNCERTAIN_MARKER)
+
+    fun isSuccess(raw: String): Boolean {
+        if (isUncertain(raw) || isFailure(raw)) return false
+        // A successful command either produced output or used the empty-output notice.
+        return raw.trim().isNotEmpty()
+    }
 
     fun clean(raw: String): String {
         val text = raw.replace("\r", "")
@@ -25,6 +39,8 @@ object ShellOutput {
     }
 
     fun isFailure(raw: String): Boolean {
+        // An interrupted response is never a success, whatever text it carried before the break.
+        if (isUncertain(raw)) return true
         val text = clean(raw).lowercase()
         if (text.isBlank()) return false
         return text.startsWith("error") ||
