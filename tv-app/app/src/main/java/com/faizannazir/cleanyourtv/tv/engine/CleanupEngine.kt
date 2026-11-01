@@ -3,6 +3,7 @@ package com.faizannazir.cleanyourtv.tv.engine
 import com.faizannazir.cleanyourtv.tv.model.ActionType
 import com.faizannazir.cleanyourtv.tv.model.AppCategory
 import com.faizannazir.cleanyourtv.tv.model.AppInfo
+import com.faizannazir.cleanyourtv.tv.model.BackupTarget
 import com.faizannazir.cleanyourtv.tv.model.CleanupBaseline
 import com.faizannazir.cleanyourtv.tv.model.CleanupRecord
 
@@ -10,7 +11,12 @@ data class CleanupContext(
     val deviceModel: String,
     val androidVersion: String,
     val totalAppsScanned: Int,
-    val targetLabel: String = ""
+    val targetLabel: String = "",
+    /**
+     * The configured host and port this cleanup will talk to. A saved baseline may only be used
+     * when it is bound to this exact target.
+     */
+    val target: BackupTarget? = null
 )
 
 data class CleanupOutcome(
@@ -43,6 +49,34 @@ class CleanupEngine(
             log.append("Debloat Execution Log:\n")
         }
         log.append("------------------------------------\n")
+
+        val target = context.target
+        if (target == null) {
+            log.append("\nERROR: No TV target is configured, so a target-bound backup cannot be used.\n")
+            log.append("No changes were made to the TV.\n")
+            return CleanupOutcome(backupSaved = false, aborted = true, log = log.toString())
+        }
+
+        val backupStatus = backup.inspect(target)
+        when (backupStatus.state) {
+            BackupState.LEGACY -> {
+                log.append("\nERROR: A saved baseline was written by an older version and is not bound to a TV.\n")
+                log.append("It was preserved. Adopt it for ${target.display} first, or remove it manually if it did not come from this TV.\n")
+                log.append("No changes were made to the TV.\n")
+                return CleanupOutcome(backupSaved = false, aborted = true, log = log.toString())
+            }
+            BackupState.UNREADABLE -> {
+                log.append("\nERROR: A saved baseline exists but cannot be read (${backupStatus.detail}).\n")
+                log.append("It was preserved and was not overwritten. No changes were made to the TV.\n")
+                return CleanupOutcome(backupSaved = false, aborted = true, log = log.toString())
+            }
+            BackupState.TARGET_MISMATCH -> {
+                log.append("\nERROR: The saved baseline belongs to ${backupStatus.target?.display ?: "another target"}, not ${target.display}.\n")
+                log.append("Restoring or extending another TV's backup is refused. No changes were made to the TV.\n")
+                return CleanupOutcome(backupSaved = false, aborted = true, log = log.toString())
+            }
+            BackupState.MISSING, BackupState.BOUND -> Unit
+        }
 
         val eligible = mutableListOf<AppInfo>()
         targets.distinctBy { it.packageName.replace("\r", "").trim() }.forEach { app ->
@@ -157,7 +191,8 @@ class CleanupEngine(
             return CleanupOutcome(backupSaved = false, aborted = true, log = log.toString())
         }
 
-        val existingBaseline = backup.loadLatestBaseline()
+        val existingBaseline =
+            if (backupStatus.state == BackupState.BOUND) backupStatus.baseline else null
         val requestedBaseline = CleanupBaseline(
             timestamp = now,
             deviceModel = context.deviceModel,
@@ -167,8 +202,22 @@ class CleanupEngine(
         )
         val baseline = BaselineMerger.merge(existingBaseline, requestedBaseline)
 
-        if (!backup.saveBaseline(baseline) || backup.loadLatestBaseline() == null) {
-            log.append("\nERROR: Failed to save the baseline backup to disk.\n")
+        val saveResult = backup.saveBaseline(baseline, target)
+        if (!saveResult.saved) {
+            log.append("\nERROR: Failed to save the baseline backup for ${target.display}.\n")
+            log.append("${saveResult.message}\n")
+            log.append("Refusing to touch the TV or execute any package operations.\n")
+            return CleanupOutcome(
+                backupSaved = false,
+                aborted = true,
+                log = log.toString(),
+                records = records
+            )
+        }
+
+        val savedStatus = backup.inspect(target)
+        if (savedStatus.state != BackupState.BOUND || savedStatus.baseline == null) {
+            log.append("\nERROR: The saved baseline is not bound to ${target.display} after writing.\n")
             log.append("Refusing to touch the TV or execute any package operations.\n")
             return CleanupOutcome(
                 backupSaved = false,
@@ -228,7 +277,7 @@ class CleanupEngine(
 
         // Keep the human-readable journal current. This only updates result text; the captured
         // original state and the immutable original baseline are never changed.
-        backup.updateOperationResults(operationResults)
+        backup.updateOperationResults(operationResults, target)
 
         log.append("Recovery: use Restore App States to put the captured package and AppOps states back.\n")
         if (successfullyDisabled.isNotEmpty()) {

@@ -11,6 +11,8 @@ import android.widget.TextView
 import com.faizannazir.cleanyourtv.tv.adb.AdbConnection
 import com.faizannazir.cleanyourtv.tv.adb.AdbDeviceScanner
 import com.faizannazir.cleanyourtv.tv.engine.BackupRestoreEngine
+import com.faizannazir.cleanyourtv.tv.engine.BackupState
+import com.faizannazir.cleanyourtv.tv.engine.BackupStatus
 import com.faizannazir.cleanyourtv.tv.engine.CleanupContext
 import com.faizannazir.cleanyourtv.tv.engine.CleanupEngine
 import com.faizannazir.cleanyourtv.tv.engine.CommandRunner
@@ -22,6 +24,7 @@ import com.faizannazir.cleanyourtv.tv.launcher.LauncherDeploymentWorkflow
 import com.faizannazir.cleanyourtv.tv.launcher.PackagedLauncherApkProvider
 import com.faizannazir.cleanyourtv.tv.model.AppCategory
 import com.faizannazir.cleanyourtv.tv.model.AppInfo
+import com.faizannazir.cleanyourtv.tv.model.BackupTarget
 import com.faizannazir.cleanyourtv.tv.model.DeviceInfo
 import java.util.concurrent.Executors
 
@@ -248,14 +251,25 @@ class MainActivity : Activity() {
 
         val host = getTargetHost()
         val port = getTargetPort()
-        tvStatus.text = "Console Log:\nCapturing original package and AppOps state for $host:$port..."
+        val target = BackupTarget.of(host, port)
+        if (target == null) {
+            tvStatus.text = "Console Log:\nInvalid TV address: $host:$port.\nNo changes made to the TV."
+            return
+        }
+
+        tvStatus.text = "Console Log:\nChecking the target-bound backup for ${target.display}..."
+        requireUsableBackup(target) { performDisableOperations(targets, target) }
+    }
+
+    private fun performDisableOperations(targets: List<AppInfo>, target: BackupTarget) {
+        tvStatus.text = "Console Log:\nCapturing original package and AppOps state for ${target.display}..."
 
         executor.execute {
-            val adbConn = AdbConnection(this, host, port)
+            val adbConn = AdbConnection(this, target.host, target.port)
             if (!adbConn.connect()) {
                 adbConn.disconnect()
                 runOnUiThread {
-                    tvStatus.text = "Console Log:\nADB unavailable at $host:$port.\nNo changes made to the TV."
+                    tvStatus.text = "Console Log:\nADB unavailable at ${target.display}.\nNo changes made to the TV."
                 }
                 return@execute
             }
@@ -272,7 +286,8 @@ class MainActivity : Activity() {
                         deviceModel = currentDeviceInfo?.model ?: "Android TV",
                         androidVersion = currentDeviceInfo?.androidVersion ?: "Unknown",
                         totalAppsScanned = scannedApps.size,
-                        targetLabel = "$host:$port"
+                        targetLabel = target.display,
+                        target = target
                     )
                 )
                 runOnUiThread {
@@ -285,6 +300,45 @@ class MainActivity : Activity() {
                 }
             } finally {
                 adbConn.disconnect()
+            }
+        }
+    }
+
+    /**
+     * Refuses to start cleanup or restore when the saved backup is corrupt, belongs to another
+     * target, or comes from an older build. A legacy file is adopted only after the person confirms
+     * that it was captured from the configured TV.
+     */
+    private fun requireUsableBackup(target: BackupTarget, onReady: () -> Unit) {
+        val status: BackupStatus = backupRestoreEngine.inspect(target)
+        when (status.state) {
+            BackupState.MISSING, BackupState.BOUND -> onReady()
+            BackupState.LEGACY -> AlertDialog.Builder(this)
+                .setTitle("Adopt an older backup?")
+                .setMessage(
+                    "A backup from an older app version is not bound to any TV.\n\n" +
+                            "Adopt it for ${target.display} only if it was captured from this TV. " +
+                            "The original file is preserved, and nothing on the TV is changed by adopting it."
+                )
+                .setPositiveButton("Adopt for ${target.display}") { _, _ ->
+                    val result = backupRestoreEngine.migrateLegacyBackup(target)
+                    if (result.migrated) {
+                        onReady()
+                    } else {
+                        tvStatus.text = "Console Log:\nERROR: The older backup was not adopted.\n" +
+                                "${result.message}\nNothing was changed."
+                    }
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+            BackupState.UNREADABLE -> {
+                tvStatus.text = "Console Log:\nThe saved backup cannot be read (${status.detail}).\n" +
+                        "It was preserved and was not overwritten. Nothing was changed."
+            }
+            BackupState.TARGET_MISMATCH -> {
+                tvStatus.text = "Console Log:\nThe saved backup belongs to " +
+                        "${status.target?.display ?: "another TV"}, not ${target.display}.\n" +
+                        "Restoring or extending another TV's backup is refused. Nothing was changed."
             }
         }
     }
@@ -370,27 +424,40 @@ class MainActivity : Activity() {
     }
 
     private fun runRestore() {
-        val baseline = backupRestoreEngine.loadLatestBaseline()
-        if (baseline == null) {
-            tvStatus.text = "Console Log:\nNo valid package-state baseline found to restore.\nNothing on the TV was changed."
+        val host = getTargetHost()
+        val port = getTargetPort()
+        val target = BackupTarget.of(host, port)
+        if (target == null) {
+            tvStatus.text = "Console Log:\nInvalid TV address: $host:$port.\nNo changes made to the TV."
             return
         }
+
+        requireUsableBackup(target) { performRestore(target) }
+    }
+
+    private fun performRestore(target: BackupTarget) {
+        val status = backupRestoreEngine.inspect(target)
+        if (status.state != BackupState.BOUND || status.baseline == null) {
+            tvStatus.text = "Console Log:\nNo valid package-state baseline is bound to ${target.display}.\n" +
+                    "Nothing on the TV was changed."
+            return
+        }
+
+        val baseline = status.baseline
         val plan = backupRestoreEngine.generateRestorePlan(baseline)
         if (plan.isEmpty()) {
             tvStatus.text = "Console Log:\nNo restorable package-state records were found. Nothing was changed."
             return
         }
 
-        val host = getTargetHost()
-        val port = getTargetPort()
-        tvStatus.text = "Console Log:\nRestoring original package and AppOps states for ${plan.size} packages on $host:$port..."
+        tvStatus.text = "Console Log:\nRestoring original package and AppOps states for ${plan.size} packages on ${target.display}..."
 
         executor.execute {
-            val adbConn = AdbConnection(this, host, port)
+            val adbConn = AdbConnection(this, target.host, target.port)
             if (!adbConn.connect()) {
                 adbConn.disconnect()
                 runOnUiThread {
-                    tvStatus.text = "Console Log:\nADB unavailable at $host:$port.\nNo changes made to the TV."
+                    tvStatus.text = "Console Log:\nADB unavailable at ${target.display}.\nNo changes made to the TV."
                 }
                 return@execute
             }
@@ -401,7 +468,7 @@ class MainActivity : Activity() {
                     backupRestoreEngine,
                     CommandRunner { command -> adbConn.executeShellCommand(command) }
                 )
-                val outcome = restoreEngine.restore(baseline, "$host:$port")
+                val outcome = restoreEngine.restore(baseline, target, target.display)
                 runOnUiThread {
                     tvStatus.text = outcome.log
                 }

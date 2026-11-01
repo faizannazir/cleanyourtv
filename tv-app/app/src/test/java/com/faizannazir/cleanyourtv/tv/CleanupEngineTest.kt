@@ -1,6 +1,7 @@
 package com.faizannazir.cleanyourtv.tv
 
 import com.faizannazir.cleanyourtv.tv.engine.BackupRestoreEngine
+import com.faizannazir.cleanyourtv.tv.engine.BackupState
 import com.faizannazir.cleanyourtv.tv.engine.CleanupContext
 import com.faizannazir.cleanyourtv.tv.engine.CleanupEngine
 import com.faizannazir.cleanyourtv.tv.engine.CommandRunner
@@ -10,6 +11,7 @@ import com.faizannazir.cleanyourtv.tv.engine.ShellOutput
 import com.faizannazir.cleanyourtv.tv.model.ActionType
 import com.faizannazir.cleanyourtv.tv.model.AppCategory
 import com.faizannazir.cleanyourtv.tv.model.AppInfo
+import com.faizannazir.cleanyourtv.tv.model.BackupTarget
 import com.faizannazir.cleanyourtv.tv.model.CleanupBaseline
 import com.faizannazir.cleanyourtv.tv.model.CleanupRecord
 import org.junit.Assert.assertEquals
@@ -22,7 +24,9 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
+import java.io.ObjectOutputStream
 
 class CleanupEngineTest {
 
@@ -30,6 +34,8 @@ class CleanupEngineTest {
     val tempFolder = TemporaryFolder()
 
     private lateinit var backupDir: File
+    private val target = BackupTarget.of("192.168.1.20", 5555)!!
+    private val otherTarget = BackupTarget.of("192.168.1.21", 5555)!!
 
     @Before
     fun setUp() {
@@ -120,7 +126,7 @@ class CleanupEngineTest {
         assertTrue(outcome.aborted.not())
         assertTrue(outcome.backupSaved)
 
-        val saved = backup.loadLatestBaseline()
+        val saved = backup.inspect(target).baseline
         assertNotNull(saved)
         assertEquals(2, saved!!.records.size)
         assertTrue(saved.records.all { it.isRestorable })
@@ -136,7 +142,7 @@ class CleanupEngineTest {
         // A later restore can finish the recovery using only what the interrupted run left behind.
         val restoreShell = FakeShell()
         val restoreOutcome = RestoreEngine(SafetyRulesEngine(), backup, restoreShell)
-            .restore(saved, "test-tv")
+            .restore(saved, target, target.display)
 
         assertFalse(restoreOutcome.interrupted)
         assertEquals(listOf("com.test.one", "com.test.two"), restoreOutcome.restoredPackages)
@@ -174,7 +180,7 @@ class CleanupEngineTest {
             context()
         )
 
-        val saved = backup.loadLatestBaseline()!!
+        val saved = backup.inspect(target).baseline!!
         val record = saved.records.first { it.packageName == "com.test.one" }
         assertTrue(record.previousState)
         assertEquals("allow", record.appOpsSnapshot()["RUN_IN_BACKGROUND"])
@@ -209,14 +215,14 @@ class CleanupEngineTest {
         assertFalse(captureShell.commands.any { it.startsWith("cmd appops set") })
 
         // Read the capture back from the real serialized file, not from the in-memory outcome.
-        val saved = backup.loadLatestBaseline()
+        val saved = backup.inspect(target).baseline
         assertNotNull(saved)
         val record = saved!!.records.first { it.packageName == "com.test.one" }
         assertTrue(record.isRestorable)
         assertEquals(modes, record.appOpsSnapshot())
 
         val restoreShell = FakeShell()
-        val restored = RestoreEngine(SafetyRulesEngine(), backup, restoreShell).restore(saved, "test-tv")
+        val restored = RestoreEngine(SafetyRulesEngine(), backup, restoreShell).restore(saved, target, target.display)
 
         assertFalse(restored.interrupted)
         assertEquals(listOf("com.test.one"), restored.restoredPackages)
@@ -245,13 +251,13 @@ class CleanupEngineTest {
         assertEquals(listOf("com.test.one"), outcome.disabledPackages)
         assertFalse(captureShell.commands.any { it.startsWith("cmd appops set") })
 
-        val saved = backup.loadLatestBaseline()!!
+        val saved = backup.inspect(target).baseline!!
         val record = saved.records.first { it.packageName == "com.test.one" }
         assertTrue(record.isRestorable)
         assertTrue(record.appOpsSnapshot().isEmpty())
 
         val restoreShell = FakeShell()
-        val restored = RestoreEngine(SafetyRulesEngine(), backup, restoreShell).restore(saved)
+        val restored = RestoreEngine(SafetyRulesEngine(), backup, restoreShell).restore(saved, target)
 
         assertFalse(restored.interrupted)
         assertTrue(restoreShell.commands.contains("pm enable com.test.one"))
@@ -273,14 +279,14 @@ class CleanupEngineTest {
         )
 
         assertTrue(outcome.log, outcome.backupSaved)
-        val saved = backup.loadLatestBaseline()!!
+        val saved = backup.inspect(target).baseline!!
         assertEquals(
             mapOf("RUN_IN_BACKGROUND" to "deny", "WAKE_LOCK" to "ignore"),
             saved.records.first { it.packageName == "com.test.one" }.appOpsSnapshot()
         )
 
         val restoreShell = FakeShell()
-        RestoreEngine(SafetyRulesEngine(), backup, restoreShell).restore(saved)
+        RestoreEngine(SafetyRulesEngine(), backup, restoreShell).restore(saved, target)
 
         assertTrue(restoreShell.commands.contains("cmd appops set com.test.one RUN_IN_BACKGROUND deny"))
         assertTrue(restoreShell.commands.contains("cmd appops set com.test.one WAKE_LOCK ignore"))
@@ -302,13 +308,13 @@ class CleanupEngineTest {
         assertFalse(outcome.aborted)
         assertFalse(shell.commands.any { it.startsWith("cmd appops set") })
 
-        val saved = backup.loadLatestBaseline()!!
+        val saved = backup.inspect(target).baseline!!
         val record = saved.records.first { it.packageName == "com.test.one" }
         assertTrue(record.isRestorable)
         assertTrue(record.appOpsSnapshot().isEmpty())
 
         val restoreShell = FakeShell()
-        RestoreEngine(SafetyRulesEngine(), backup, restoreShell).restore(saved)
+        RestoreEngine(SafetyRulesEngine(), backup, restoreShell).restore(saved, target)
 
         assertTrue(restoreShell.commands.contains("pm enable com.test.one"))
         assertFalse(restoreShell.commands.any { it.startsWith("cmd appops set") })
@@ -356,7 +362,7 @@ class CleanupEngineTest {
         assertFalse(outcome.records[0].isRestorable)
         assertFalse(shell.commands.any { it.startsWith("pm disable-user") })
         assertFalse(shell.commands.any { it.startsWith("cmd appops set") })
-        assertNull(backup.loadLatestBaseline())
+        assertNull(backup.inspect(target).baseline)
     }
 
     @Test
@@ -386,7 +392,9 @@ class CleanupEngineTest {
             )
         )
 
-        val outcome = RestoreEngine(SafetyRulesEngine(), backup, shell).restore(baseline, "test-tv")
+        assertTrue(backup.saveBaseline(baseline, target).saved)
+        val outcome = RestoreEngine(SafetyRulesEngine(), backup, shell)
+            .restore(baseline, target, target.display)
 
         assertFalse(outcome.interrupted)
         assertEquals(listOf("com.test.one", "com.test.two"), outcome.restoredPackages)
@@ -417,17 +425,88 @@ class CleanupEngineTest {
             )
         )
 
-        RestoreEngine(SafetyRulesEngine(), backup, shell).restore(baseline)
+        assertTrue(backup.saveBaseline(baseline, target).saved)
+        RestoreEngine(SafetyRulesEngine(), backup, shell).restore(baseline, target)
 
         assertFalse(shell.commands.any { it.startsWith("pm disable-user") })
         assertTrue(shell.commands.contains("cmd appops set com.android.settings RUN_IN_BACKGROUND allow"))
+    }
+
+    @Test
+    fun testCleanupRefusesABackupBoundToAnotherTargetBeforeAnyMutation() {
+        val backup = BackupRestoreEngine(backupDir)
+        val otherBaseline = CleanupBaseline(
+            timestamp = 1000L,
+            deviceModel = "TV B",
+            androidVersion = "12",
+            totalAppsScanned = 1,
+            records = listOf(
+                record(
+                    "com.test.two",
+                    previousState = true,
+                    appOps = mapOf("RUN_IN_BACKGROUND" to "allow")
+                )
+            )
+        )
+        assertTrue(backup.saveBaseline(otherBaseline, otherTarget).saved)
+
+        val shell = FakeShell()
+        val outcome = CleanupEngine(SafetyRulesEngine(), backup, shell).executeCleanup(
+            listOf(app("com.test.one")),
+            context()
+        )
+
+        assertTrue(outcome.aborted)
+        assertFalse(outcome.backupSaved)
+        assertTrue(outcome.log, outcome.log.contains(otherTarget.display))
+        assertTrue("no TV state was read or changed: ${shell.commands}", shell.commands.isEmpty())
+        assertEquals(BackupState.BOUND, backup.inspect(otherTarget).state)
+    }
+
+    @Test
+    fun testCleanupAndRestoreRefuseAnUnboundLegacyBackup() {
+        val backup = BackupRestoreEngine(backupDir)
+        val legacy = CleanupBaseline(
+            timestamp = 1000L,
+            deviceModel = "Test TV",
+            androidVersion = "12",
+            totalAppsScanned = 1,
+            records = listOf(
+                record(
+                    "com.test.one",
+                    previousState = true,
+                    appOps = mapOf("RUN_IN_BACKGROUND" to "allow")
+                )
+            )
+        )
+        FileOutputStream(File(backupDir, BackupRestoreEngine.LATEST_FILE_NAME)).use { fileOut ->
+            ObjectOutputStream(fileOut).use { it.writeObject(legacy) }
+        }
+
+        val cleanupShell = FakeShell()
+        val cleanup = CleanupEngine(SafetyRulesEngine(), backup, cleanupShell).executeCleanup(
+            listOf(app("com.test.one")),
+            context()
+        )
+        assertTrue(cleanup.aborted)
+        assertFalse(cleanup.backupSaved)
+        assertTrue(cleanup.log, cleanup.log.contains("not bound to a TV"))
+        assertTrue(cleanupShell.commands.isEmpty())
+
+        val restoreShell = FakeShell()
+        val restore = RestoreEngine(SafetyRulesEngine(), backup, restoreShell)
+            .restore(legacy, target, target.display)
+        assertTrue(restore.log, restore.log.contains("not bound to a TV"))
+        assertTrue(restoreShell.commands.isEmpty())
+        assertEquals(BackupState.LEGACY, backup.inspect(target).state)
     }
 
     private fun context() = CleanupContext(
         deviceModel = "Test TV",
         androidVersion = "12",
         totalAppsScanned = 3,
-        targetLabel = "test-tv"
+        targetLabel = target.display,
+        target = target
     )
 
     private fun app(

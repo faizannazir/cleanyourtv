@@ -1,5 +1,6 @@
 package com.faizannazir.cleanyourtv.tv.engine
 
+import com.faizannazir.cleanyourtv.tv.model.BackupTarget
 import com.faizannazir.cleanyourtv.tv.model.CleanupBaseline
 import com.faizannazir.cleanyourtv.tv.model.CleanupRecord
 
@@ -19,7 +20,11 @@ class RestoreEngine(
     private val commandRunner: CommandRunner
 ) {
 
-    fun restore(baseline: CleanupBaseline, targetLabel: String = ""): RestoreOutcome {
+    fun restore(
+        baseline: CleanupBaseline,
+        target: BackupTarget,
+        targetLabel: String = ""
+    ): RestoreOutcome {
         val log = StringBuilder()
         if (targetLabel.isNotBlank()) {
             log.append("Restoration Execution Log ($targetLabel):\n")
@@ -27,6 +32,40 @@ class RestoreEngine(
             log.append("Restoration Execution Log:\n")
         }
         log.append("------------------------------------\n")
+
+        // Validate provenance again, immediately before any mutation. A caller cannot bypass this
+        // by passing a baseline object that was loaded from a different target, or one that has
+        // been replaced on disk since it was read.
+        val status = backup.inspect(target)
+        when (status.state) {
+            BackupState.LEGACY -> {
+                log.append("ERROR: The saved baseline was written by an older version and is not bound to a TV.\n")
+                log.append("It was preserved. Adopt it for ${target.display} first. Nothing was changed.\n")
+                return RestoreOutcome(log = log.toString())
+            }
+            BackupState.UNREADABLE -> {
+                log.append("ERROR: The saved baseline exists but cannot be read (${status.detail}).\n")
+                log.append("It was preserved. Nothing was changed.\n")
+                return RestoreOutcome(log = log.toString())
+            }
+            BackupState.TARGET_MISMATCH -> {
+                log.append("ERROR: The saved baseline belongs to ${status.target?.display ?: "another target"}, not ${target.display}.\n")
+                log.append("Restoring another TV's backup is refused. Nothing was changed.\n")
+                return RestoreOutcome(log = log.toString())
+            }
+            BackupState.MISSING -> {
+                log.append("ERROR: No target-bound baseline exists for ${target.display}.\n")
+                log.append("Nothing was changed.\n")
+                return RestoreOutcome(log = log.toString())
+            }
+            BackupState.BOUND -> Unit
+        }
+
+        if (status.baseline != baseline) {
+            log.append("ERROR: The baseline passed to restore is not the one currently saved for ${target.display}.\n")
+            log.append("Load it again before restoring. Nothing was changed.\n")
+            return RestoreOutcome(log = log.toString())
+        }
 
         val plan = backup.generateRestorePlan(baseline)
         if (plan.isEmpty()) {
