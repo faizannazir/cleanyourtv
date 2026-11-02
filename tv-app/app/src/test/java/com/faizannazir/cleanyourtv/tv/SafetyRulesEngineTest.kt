@@ -34,6 +34,12 @@ class SafetyRulesEngineTest {
     }
 
     @Test
+    fun testOrdinaryPackageNamesAreNotProtectedByKeySubstring() {
+        assertFalse(engine.isProtected("com.example.monkeytracker"))
+        assertFalse(engine.isProtected("com.example.keyboardtheme"))
+    }
+
+    @Test
     fun testUserProtectedPackagesAreProtected() {
         engine.setUserProtectedPackages(setOf("com.my.custom.app"))
         assertTrue(engine.isProtected("com.my.custom.app"))
