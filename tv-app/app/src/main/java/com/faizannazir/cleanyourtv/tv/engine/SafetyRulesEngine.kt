@@ -98,7 +98,7 @@ class SafetyRulesEngine {
         )
 
         val CRITICAL_HARDWARE_KEYWORDS = listOf(
-            "bluetooth", "power", "standby", "cec", "input", "remote", "key", "wifi"
+            "bluetooth", "power", "standby", "cec", "input", "remote", "wifi"
         )
     }
 
